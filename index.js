@@ -1,5 +1,6 @@
 require("dotenv").config();
 const axios = require("axios");
+const axiosRetry = require("axios-retry");
 const Web3 = require("web3");
 const { contracts } = require("./Contracts");
 const _ = require("lodash");
@@ -22,6 +23,14 @@ const subgraphs = [
   "https://api.thegraph.com/subgraphs/name/paraswap/paraswap-subgraph-avalanche",
   "https://api.thegraph.com/subgraphs/name/paraswap/paraswap-subgraph-bsc",
   "https://api.thegraph.com/subgraphs/name/paraswap/paraswap-subgraph-polygon",
+];
+
+// override any prices that are not being returned by coingecko
+const priceOverrides = [
+  // { address: "0x0c1253a30da9580472064a91946c5ce0c58acf7f", network: "binance-smart-chain", price: 17 },
+  // { address: "0x1d2f0da169ceb9fc7b3144628db156f3f6c60dbe", network: "polygon-pos", price: 10 },
+  // { address: "0x8da443f84fea710266c8eb6bc34b71702d033ef2", network: "fantom", price: 5 },
+  // { address: "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7", network: "avalanche", price: 30 }
 ];
 
 const getNetwork = (x) => x.substring(x.indexOf("-") + 1, x.length);
@@ -52,17 +61,17 @@ const network = (network) =>
     ? "polygon-pos"
     : null;
 
-const zapper = (chain) =>
+const nativeId = (chain) =>
   chain === "ethereum"
-    ? 1
+    ? "ethereum"
     : chain === "binance-smart-chain"
-    ? 56
+    ? "binancecoin"
     : chain === "fantom"
-    ? 250
+    ? "fantom"
     : chain === "avalanche"
-    ? 43114
-    : chain === "polygon"
-    ? 137
+    ? "avalanche-2"
+    : chain === "polygon-pos"
+    ? "matic-network"
     : null;
 
 // Fetches swaps from each networks subgraph
@@ -72,7 +81,7 @@ async function getSwaps(graph) {
     .post(graph, {
       query: `
       {
-        swaps(first: 15, orderBy: timestamp, orderDirection: desc) {
+        swaps(first: 1000, orderBy: timestamp, orderDirection: desc,where:{timestamp_lte: ${toTimestamp}, timestamp_gte: ${startTimestamp}}) {
           srcToken
           destToken
           srcAmount
@@ -199,10 +208,13 @@ async function scaleDecimals() {
 }
 
 async function getPrices() {
-  const zapperPrices = await getZapper();
   const tokens = await scaleDecimals();
   let prices = tokens.map(async (token) => {
-    token.price = await coingecko(network(token.chainId), token.address);
+    token.price = await getRateLimitedEvents(
+      network(token.chainId),
+      token.address
+    );
+    console.log(network(token.chainId), token.address, token.price)
     return token;
   });
   let priceTokens = await Promise.all(prices).then((token) => {
@@ -213,25 +225,6 @@ async function getPrices() {
     return token;
   });
 
-  const fallbackPrice = zapperPrices.flat();
-
-  balanceUSD.forEach((token) => {
-    if (isNaN(token.balanceUSD) === true) {
-      fallbackPrice.map((zapperPrice) => {
-        if (
-          token.address === zapperPrice.address &&
-          token.chainId === zapperPrice.chainId
-        ) {
-          token.price = zapperPrice.price;
-          token.balanceUSD = token.price * token.balance;
-          return token;
-        }
-      });
-      return token;
-    } else {
-      return token;
-    }
-  });
   let totalBalances = balanceUSD.filter(
     (value) => isNaN(value.balanceUSD) === false
   );
@@ -241,7 +234,10 @@ async function getPrices() {
 // Get token decimals.
 async function getTokenDecimals(url, tokenAddress) {
   web3 = new Web3(url);
-  if (tokenAddress === "0x0000000000000000000000000000000000000000") {
+  if (
+    tokenAddress === "0x0000000000000000000000000000000000000000" ||
+    tokenAddress === "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  ) {
     return 18;
   }
   const tokenContract = new web3.eth.Contract(
@@ -261,48 +257,59 @@ async function getTokenDecimals(url, tokenAddress) {
   return tokenDecimals;
 }
 
-async function zapperPrices(network) {
-  try {
-    const zapperPrice = await axios
-      .get(
-        `https://api.zapper.fi/v2/prices?network=${network}&api_key=96e0cc51-a62e-42ca-acee-910ea7d2a241`
-      )
-      .then((res) => res.data);
-    const result = zapperPrice.map((contract) => {
-      return {
-        address: contract.address,
-        price: contract.price,
-        chainId: zapper(contract.network),
-      };
+async function getRateLimitedEvents(network, contractAddress) {
+  axiosRetry(axios, {
+    retries: 25, // number of retries
+    retryDelay: (retryCount) => {
+      console.log(`retry attempt: ${retryCount}`);
+      return retryCount * 30000; // time interval between retries
+    },
+    retryCondition: (error) => {
+      // if retry condition is not specified, by default idempotent requests are retried
+      return error;
+    },
+  });
+
+  const url =
+    contractAddress === "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      ? `https://api.coingecko.com/api/v3/coins/${nativeId(
+          network
+        )}/market_chart/range?vs_currency=usd&from=${fromTimestamp}&to=${toTimestamp}`
+      : `https://api.coingecko.com/api/v3/coins/${network}/contract/${contractAddress}/market_chart/range?vs_currency=usd&from=${fromTimestamp}&to=${toTimestamp}`;
+
+  const response = await axios({
+    method: "GET",
+    url: url,
+  })
+    .then((res) => {
+      let priceArr = [];
+      const average = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+      const prices = res.data.prices;
+      prices.forEach((x) => {
+        priceArr.push(x[1]);
+      });
+      const averagePrice = average(priceArr);
+      return averagePrice;
+    })
+    .catch((err) => {
+      if (err.response.status !== 200) {
+        let price = 0;
+        priceOverrides.forEach((x) => {
+          if (x.address === contractAddress && x.network === network) {
+            price = x.price;
+            return price;
+          } else {
+            price = 0;
+            console.log(
+              `Used price 0 for network: ` + network + " " + contractAddress
+            );
+            return price;
+          }
+        });
+        return price;
+      }
     });
-    return result;
-  } catch {
-    console.log(`error in zapperPrices`);
-  }
-}
-
-async function getZapper() {
-  const allPrices = await Promise.all([
-    zapperPrices("binance-smart-chain"),
-    zapperPrices("ethereum"),
-    zapperPrices("polygon"),
-    zapperPrices("fantom"),
-    zapperPrices("avalanche"),
-  ]);
-  return allPrices;
-}
-
-async function coingecko(network, contractAddress) {
-  try {
-    const coingecko = await axios
-      .get(
-        `https://api.coingecko.com/api/v3/coins/${network}/contract/${contractAddress}/market_chart/range?vs_currency=usd&from=${fromTimestamp}&to=${toTimestamp}`
-      )
-      .then((res) => res.data.prices[0][1]);
-    return coingecko;
-  } catch {
-    console.log(`Missing coingecko price for: ${network}: ${contractAddress}`);
-  }
+  return response;
 }
 
 async function main() {
@@ -315,7 +322,7 @@ async function main() {
   let total = filteredArr.reduce(function (sum, current) {
     return sum + current.balanceUSD;
   }, 0);
-  console.log(moneyFormat(total));
+  console.log(moneyFormat(total / 2));
   return total;
 }
 
